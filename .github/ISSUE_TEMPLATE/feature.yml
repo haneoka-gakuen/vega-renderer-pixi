@@ -1,0 +1,17 @@
+name: Feature proposal
+description: Propose a renderer capability
+title: "[Proposal] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+    validations:
+      required: true
+  - type: textarea
+    id: lifecycle
+    attributes:
+      label: Resource and lifecycle impact
+    validations:
+      required: true

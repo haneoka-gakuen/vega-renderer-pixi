@@ -1,0 +1,13 @@
+packages:
+  - "."
+  - ".dependencies/vega"
+  - ".dependencies/vega/packages/protocol"
+
+linkWorkspacePackages: true
+autoInstallPeers: false
+strictPeerDependencies: true
+engineStrict: true
+nodeVersion: 20.19.0
+
+allowBuilds:
+  esbuild: true
