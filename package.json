@@ -46,7 +46,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "verify:package": "node scripts/verify-package.mjs",
     "check": "pnpm run typecheck && pnpm run build && pnpm run verify:package",
-    "prepack": "pnpm run check"
+    "prepack": "pnpm run check",
+    "format": "prettier --write . --ignore-unknown",
+    "format:check": "prettier --check . --ignore-unknown"
   },
   "peerDependencies": {
     "@haneoka/vega": "^0.1.0",
@@ -55,7 +57,8 @@
   "devDependencies": {
     "@haneoka/vega": "^0.1.0",
     "pixi.js": "6.5.10",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "prettier": "3.7.4"
   },
   "publishConfig": {
     "access": "public",

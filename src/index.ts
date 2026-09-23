@@ -1,20 +1,23 @@
 import {
+  StoryScreenEffects,
+  isStoryScreenSpriteEffect,
+  type StoryScreenEffectDefinition,
+  type StoryScreenEffectSnapshot,
+} from "@haneoka/vega/renderer-kit";
+import { PixiScreenSpriteRenderer } from "./ScreenSpriteRenderer.js";
+import {
   GenericStoryScene,
+  storyResourceContentType,
   defineVegaPlugin,
+  type StoryResourceResolver,
   type StorySceneBackendContext,
   type StoryScenePreviewOptions,
   type VegaPlugin,
 } from "@haneoka/vega";
-import {
-  Application,
-  BaseTexture,
-  Container,
-  Graphics,
-  ParticleContainer,
-  Sprite,
-  Texture,
-  filters,
-} from "pixi.js";
+import { Application, BaseTexture, Container, Sprite, Texture, VERSION as PIXI_VERSION, filters } from "pixi.js";
+import { SharedPixiTextureCache, type SharedPixiTextureLease } from "./SharedPixiTextureCache.js";
+import { computeWebGalLayout } from "./webgalLayout.js";
+export { computeWebGalLayout, type WebGalLayoutOptions, type WebGalPositioning } from "./webgalLayout.js";
 
 const { BlurFilter, ColorMatrixFilter } = filters;
 
@@ -49,16 +52,6 @@ export interface PixiStageInspection {
   readonly effects: readonly string[];
 }
 
-export type PixiAmbientEffect = "rain" | "snow" | "petals";
-
-export interface PixiAmbientEffectOptions {
-  readonly count?: number;
-  readonly speed?: number;
-  readonly alpha?: number;
-  readonly color?: number;
-  readonly seed?: number;
-}
-
 interface PixiLease {
   readonly sprite: Sprite;
   readonly release: () => void;
@@ -76,22 +69,48 @@ interface PixiCharacter {
   worldPosition: { x: number; y: number } | null;
 }
 
-interface PixiEffectInstance {
-  readonly container: Container;
-  readonly tick: (delta: number) => void;
-  readonly texture: Texture;
+interface PixiSeekPresentation {
+  readonly version: 1;
+  readonly world: readonly [number, number, number, number, number, number, number, number];
+  readonly colorMatrix: readonly number[] | null;
+  readonly screenEffects: readonly StoryScreenEffectSnapshot[];
+  readonly characters: readonly {
+    readonly target: string;
+    readonly positionType: number;
+    readonly brightness: number;
+    readonly blur: number;
+    readonly offsetX: number;
+    readonly offsetY: number;
+    readonly worldPosition: { x: number; y: number } | null;
+    readonly alpha: number;
+    readonly angle: number;
+  }[];
 }
 
-interface PixiTextureRecord {
+interface PixiTextureResource {
   readonly texture: Texture;
-  readonly ready: Promise<void>;
-  references: number;
-  disposed: boolean;
+  readonly releaseRenderable: () => void;
+  readonly estimatedBytes: number;
+}
+
+interface PixiTextureIdentity {
+  readonly source: string;
+  readonly bytes: Readonly<Uint8Array>;
+  readonly forget: () => void;
 }
 
 interface PixiAnimation {
   readonly cancel: () => void;
 }
+
+interface LegacyPixiPrepare {
+  upload(texture: Texture, done: () => void): void;
+}
+
+const pixiPrepareSupportsPromise = (() => {
+  const [major = 0, minor = 0] = PIXI_VERSION.split(".").map(Number);
+  return major > 6 || (major === 6 && minor >= 5);
+})();
 
 const finite = (value: unknown, fallback = 0): number => {
   const result = Number(value);
@@ -110,42 +129,23 @@ const object = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 
 const firstString = (...values: unknown[]): string =>
-  values
-    .map((value) => (typeof value === "string" ? value.trim() : ""))
-    .find(Boolean) ?? "";
+  values.map((value) => (typeof value === "string" ? value.trim() : "")).find(Boolean) ?? "";
 
 const looksLikeImage = (source: string): boolean =>
-  /^(?:blob:|data:image\/)/iu.test(source) ||
-  /\.(?:avif|bmp|gif|jpe?g|png|svg|webp)(?:[?#].*)?$/iu.test(source);
+  /^(?:blob:|data:image\/)/iu.test(source) || /\.(?:avif|bmp|gif|jpe?g|png|svg|webp)(?:[?#].*)?$/iu.test(source);
 
 export const pixiStaticCharacterSource = (entry: unknown): string => {
   const source = object(entry);
   const runtime = object(source.runtime);
-  const model = firstString(
-    runtime.model,
-    runtime.modelUrl,
-    source.model,
-    source.modelUrl,
-  );
-  const explicit = firstString(
-    runtime.imageUrl,
-    source.imageUrl,
-    source.portraitUrl,
-    runtime.source,
-    source.source,
-  );
+  const model = firstString(runtime.model, runtime.modelUrl, source.model, source.modelUrl);
+  const explicit = firstString(runtime.imageUrl, source.imageUrl, source.portraitUrl, runtime.source, source.source);
   if (explicit) return explicit;
   return looksLikeImage(model) ? model : "";
 };
 
 const backgroundSource = (entry: unknown): string => {
   const source = object(entry);
-  return firstString(
-    source.playableUrl,
-    source.imageUrl,
-    source.url,
-    source.source,
-  );
+  return firstString(source.playableUrl, source.imageUrl, source.url, source.source);
 };
 
 export const computePixiViewport = (
@@ -158,12 +158,8 @@ export const computePixiViewport = (
   const safeHeight = positive(height, 1);
   const safeReferenceWidth = positive(referenceWidth, 1920);
   const safeReferenceHeight = positive(referenceHeight, 1080);
-  const scale = Math.min(
-    safeWidth / safeReferenceWidth,
-    safeHeight / safeReferenceHeight,
-  );
-  const normalizeOffset = (value: number): number =>
-    Math.abs(value) < Number.EPSILON * 512 ? 0 : value;
+  const scale = Math.min(safeWidth / safeReferenceWidth, safeHeight / safeReferenceHeight);
+  const normalizeOffset = (value: number): number => (Math.abs(value) < Number.EPSILON * 512 ? 0 : value);
   return {
     width: safeWidth,
     height: safeHeight,
@@ -178,27 +174,33 @@ const tintFromBrightness = (brightness: number): number => {
   return (channel << 16) | (channel << 8) | channel;
 };
 
-const waitForTexture = (texture: Texture): Promise<void> => {
+const waitForTexture = (texture: Texture, signal?: AbortSignal): Promise<void> => {
   if (texture.baseTexture.valid) return Promise.resolve();
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
     const loaded = () => {
-      cleanup();
-      resolve();
+      finish(resolve);
     };
-    const failed = (error: unknown) => {
-      cleanup();
-      reject(
-        error instanceof Error
-          ? error
-          : new Error("Pixi texture failed to load"),
-      );
+    const failed = (_baseTexture: BaseTexture, error: unknown) => {
+      finish(() => reject(error instanceof Error ? error : new Error("Pixi texture failed to load")));
     };
+    const aborted = () => finish(() => reject(abortReason(signal!)));
     const cleanup = () => {
       texture.baseTexture.off("loaded", loaded);
       texture.baseTexture.off("error", failed);
+      signal?.removeEventListener("abort", aborted);
     };
     texture.baseTexture.once("loaded", loaded);
     texture.baseTexture.once("error", failed);
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (signal?.aborted) aborted();
   });
 };
 
@@ -209,10 +211,7 @@ const abortReason = (signal: AbortSignal): unknown => {
   return error;
 };
 
-const withAbort = async <T>(
-  promise: Promise<T>,
-  signal: AbortSignal,
-): Promise<T> => {
+const withAbort = async <T>(promise: Promise<T>, signal: AbortSignal): Promise<T> => {
   if (signal.aborted) throw abortReason(signal);
   let aborted: (() => void) | undefined;
   const cancellation = new Promise<never>((_, reject) => {
@@ -251,6 +250,177 @@ const linkSignals = (
   };
 };
 
+const DEFAULT_TEXTURE_CACHE_IDLE_ENTRIES = 48;
+const DEFAULT_TEXTURE_CACHE_MEGABYTES = 384;
+const BYTES_PER_RGBA_PIXEL = 4;
+
+const estimateTextureBytes = (texture: Texture, sourceByteLength: number): number => {
+  const pixelWidth = Math.max(1, finite(texture.baseTexture.realWidth, 1));
+  const pixelHeight = Math.max(1, finite(texture.baseTexture.realHeight, 1));
+  return Math.min(
+    Number.MAX_SAFE_INTEGER,
+    Math.ceil(pixelWidth * pixelHeight * BYTES_PER_RGBA_PIXEL) + Math.max(0, Math.trunc(sourceByteLength)),
+  );
+};
+
+const pixiTextureBlobPart = (bytes: Readonly<Uint8Array>): Uint8Array<ArrayBuffer> => {
+  if (bytes.buffer instanceof ArrayBuffer) {
+    // Creating a view is allocation-only: the default Vega resolver's
+    // canonical bytes reach Blob without another JavaScript byte copy.
+    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+  // BlobPart deliberately excludes SharedArrayBuffer-backed views. Preserve
+  // compatibility with custom resolvers by copying only that uncommon case.
+  return Uint8Array.from(bytes);
+};
+
+const loadPixiTextureResource = async (
+  identity: PixiTextureIdentity,
+  signal: AbortSignal,
+): Promise<PixiTextureResource> => {
+  if (signal.aborted) throw abortReason(signal);
+  const objectUrl = URL.createObjectURL(
+    new Blob([pixiTextureBlobPart(identity.bytes)], {
+      type: storyResourceContentType(identity.source, identity.bytes),
+    }),
+  );
+  let objectUrlReleased = false;
+  const releaseObjectUrl = (): void => {
+    if (objectUrlReleased) return;
+    objectUrlReleased = true;
+    URL.revokeObjectURL(objectUrl);
+  };
+  let texture: Texture | undefined;
+  try {
+    texture = new Texture(new BaseTexture(objectUrl));
+    await waitForTexture(texture, signal);
+    return {
+      texture,
+      releaseRenderable: releaseObjectUrl,
+      estimatedBytes: estimateTextureBytes(texture, identity.bytes.byteLength),
+    };
+  } catch (error) {
+    try {
+      texture?.destroy(true);
+    } catch {
+      // Preserve the load failure while still releasing the Blob URL below.
+    } finally {
+      releaseObjectUrl();
+    }
+    throw error;
+  }
+};
+
+const canonicalTextureIdentities = new WeakMap<ArrayBufferLike, Map<string, PixiTextureIdentity>>();
+const resolverTextureIdentities = new WeakMap<StoryResourceResolver, Map<string, PixiTextureIdentity>>();
+const textureIdentityOwners = new WeakMap<PixiTextureIdentity, Set<Set<PixiTextureIdentity>>>();
+
+const trackTextureIdentity = (identity: PixiTextureIdentity, owner: Set<PixiTextureIdentity>): void => {
+  owner.add(identity);
+  let owners = textureIdentityOwners.get(identity);
+  if (!owners) {
+    owners = new Set();
+    textureIdentityOwners.set(identity, owners);
+  }
+  owners.add(owner);
+};
+
+const forgetTextureIdentity = (identity: PixiTextureIdentity): void => {
+  identity.forget();
+  const owners = textureIdentityOwners.get(identity);
+  if (owners) {
+    for (const owner of owners) owner.delete(identity);
+    textureIdentityOwners.delete(identity);
+  }
+};
+
+const releaseTextureIdentityOwner = (owner: Set<PixiTextureIdentity>): void => {
+  for (const identity of owner) {
+    const owners = textureIdentityOwners.get(identity);
+    owners?.delete(owner);
+    if (owners?.size === 0) textureIdentityOwners.delete(identity);
+  }
+  owner.clear();
+};
+
+const sameTextureBytes = (left: Readonly<Uint8Array>, right: Readonly<Uint8Array>): boolean => {
+  if (left.buffer === right.buffer && left.byteOffset === right.byteOffset && left.byteLength === right.byteLength) {
+    return true;
+  }
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+};
+
+const textureIdentityFor = (
+  source: string,
+  resources: StoryResourceResolver,
+  bytes: Readonly<Uint8Array>,
+  sharedBytes: boolean,
+): PixiTextureIdentity => {
+  if (sharedBytes) {
+    let identities = canonicalTextureIdentities.get(bytes.buffer);
+    if (!identities) {
+      identities = new Map();
+      canonicalTextureIdentities.set(bytes.buffer, identities);
+    }
+    const viewKey = `${source}\u0000${bytes.byteOffset}:${bytes.byteLength}`;
+    let identity = identities.get(viewKey);
+    if (!identity) {
+      let created!: PixiTextureIdentity;
+      created = {
+        source,
+        bytes,
+        forget: () => {
+          if (identities.get(viewKey) === created) {
+            identities.delete(viewKey);
+          }
+        },
+      };
+      identity = created;
+      identities.set(viewKey, identity);
+    }
+    return identity;
+  }
+
+  let identities = resolverTextureIdentities.get(resources);
+  if (!identities) {
+    identities = new Map();
+    resolverTextureIdentities.set(resources, identities);
+  }
+  let identity = identities.get(source);
+  if (!identity || !sameTextureBytes(identity.bytes, bytes)) {
+    let created!: PixiTextureIdentity;
+    created = {
+      source,
+      bytes,
+      forget: () => {
+        if (identities.get(source) === created) identities.delete(source);
+      },
+    };
+    identity = created;
+    identities.set(source, identity);
+  }
+  return identity;
+};
+
+const sharedTextureCache = new SharedPixiTextureCache<PixiTextureIdentity, PixiTextureResource>(
+  loadPixiTextureResource,
+  (resource) => {
+    try {
+      resource.texture.destroy(true);
+    } finally {
+      resource.releaseRenderable();
+    }
+  },
+  DEFAULT_TEXTURE_CACHE_IDLE_ENTRIES,
+  (resource) => resource.estimatedBytes,
+  DEFAULT_TEXTURE_CACHE_MEGABYTES * 1024 * 1024,
+  forgetTextureIdentity,
+);
+
 /**
  * Pixi owns stage pixels; GenericStoryScene remains the command-complete
  * fallback for DOM UI, video, rule transitions, saves and unsupported assets.
@@ -258,8 +428,8 @@ const linkSignals = (
 export class PixiStoryScene extends GenericStoryScene {
   readonly backend: string;
   readonly profile: "vega" | "webgal";
-  private readonly context: StorySceneBackendContext;
-  private readonly options: Required<
+  protected readonly context: StorySceneBackendContext;
+  protected readonly options: Required<
     Pick<
       PixiRendererOptions,
       | "referenceWidth"
@@ -271,51 +441,117 @@ export class PixiStoryScene extends GenericStoryScene {
       | "profile"
     >
   >;
-  private app: Application | null = null;
+  protected app: Application | null = null;
   private pixiRoot: HTMLElement | null = null;
   private readonly viewportWorld = new Container();
-  private readonly world = new Container();
+  protected readonly world = new Container();
   private readonly pixiBackgroundLayer = new Container();
   private readonly pixiCharacterLayer = new Container();
   private readonly pixiStillLayer = new Container();
   private readonly pixiEffectLayer = new Container();
-  private pixiBackgroundLease: PixiLease | null = null;
+  protected pixiBackgroundLease: PixiLease | null = null;
   private pixiStillLease: PixiLease | null = null;
-  private readonly pixiCharacters = new Map<string, PixiCharacter>();
-  private readonly pixiEffects = new Map<
-    PixiAmbientEffect,
-    PixiEffectInstance
-  >();
-  private readonly texturePool = new Map<string, PixiTextureRecord>();
+  protected readonly pixiCharacters = new Map<string, PixiCharacter>();
+  private readonly screenEffects: StoryScreenEffects;
+  private screenSprites: PixiScreenSpriteRenderer | undefined;
+  private readonly pixiBackgroundEffects = new Container();
+  private screenEffectRenderLease: (() => void) | undefined;
+  private readonly tickScreenEffects = (delta: number) => {
+    if (!this.pixiDeterministicReplay) {
+      this.screenEffects.update(delta / 60);
+      this.syncScreenEffects();
+    }
+  };
+  get screenEffectKeys(): readonly string[] {
+    return this.screenEffects.keys;
+  }
+  async setScreenEffect(key: string, definition: StoryScreenEffectDefinition, signal?: AbortSignal): Promise<void> {
+    await this.screenEffects.set(key, definition, signal);
+  }
+  clearScreenEffects(key?: string): void {
+    this.screenEffects.clear(key);
+  }
+  private syncScreenEffects(): void {
+    this.screenSprites?.sync(this.screenEffects.batches);
+    const animated = this.screenEffects.batches.some((batch) => batch.instances.length > 0);
+    if (animated && !this.screenEffectRenderLease) this.screenEffectRenderLease = this.retainContinuousRender();
+    else if (!animated && this.screenEffectRenderLease) {
+      this.screenEffectRenderLease();
+      this.screenEffectRenderLease = undefined;
+    }
+    this.requestRender();
+  }
+  private readonly textureCache: SharedPixiTextureCache<PixiTextureIdentity, PixiTextureResource>;
+  private readonly textureCacheKeys = new Set<PixiTextureIdentity>();
+  private readonly episodeTextureLeases = new Map<PixiTextureIdentity, SharedPixiTextureLease<PixiTextureResource>>();
+  private readonly texturePreparations = new WeakMap<Texture, Promise<void>>();
+  private readonly pendingTexturePreparations = new Set<Promise<void>>();
+  private releaseTextureCacheLimits: (() => void) | null;
   private viewport: PixiViewport = computePixiViewport(1, 1);
   private observer: ResizeObserver | null = null;
   private readonly lifecycleController = new AbortController();
   private backgroundGeneration = 0;
   private stillGeneration = 0;
   private readonly characterGenerations = new Map<string, number>();
-  private readonly animations = new Map<string, PixiAnimation>();
-  private colorMatrixFilter: InstanceType<typeof ColorMatrixFilter> | null =
-    null;
+  protected readonly animations = new Map<string, PixiAnimation>();
+  private colorMatrixFilter: InstanceType<typeof ColorMatrixFilter> | null = null;
   private pixiBackgroundBrightness = 1;
   private pixiBackgroundBlur = 0;
-  private pixiDeterministicReplay = false;
-  private pixiDestroyed = false;
+  protected pixiDeterministicReplay = false;
+  protected pixiDestroyed = false;
+  private pixiDestroyComplete = false;
+  private destroyPromise: Promise<void> | null = null;
+  private releaseTexturesRequested = false;
+  private continuousRenderReferences = 0;
+  private renderQueued = false;
 
-  constructor(
-    context: StorySceneBackendContext,
-    options: PixiRendererOptions = {},
-  ) {
+  constructor(context: StorySceneBackendContext, options: PixiRendererOptions = {}) {
     super(context.runtime, context.state, context.resources, {
-      ...(context.characterProviders
-        ? { characterProviders: context.characterProviders }
-        : {}),
+      ...(context.characterProviders ? { characterProviders: context.characterProviders } : {}),
     });
     this.context = context;
+    this.screenEffects = new StoryScreenEffects(
+      context.signal,
+      async (definition, signal) => {
+        const contribution = context.rendererExtensions?.effects.find(
+          (effect) => effect.effectType === definition.effectType,
+        );
+        if (!contribution) throw new Error(`Screen effect provider is unavailable: ${definition.effectType}`);
+        if (!this.app) throw new Error("The renderer is not ready for screen effects");
+        const effect = await contribution.create(
+          definition,
+          {
+            renderer: this.backend,
+            rendererContext: { app: this.app, world: this.world },
+            runtime: context.runtime,
+            state: context.state,
+            resources: context.resources,
+            signal,
+            service: (key) => context.rendererExtensions?.service(key),
+          },
+          signal,
+        );
+        if (!isStoryScreenSpriteEffect(effect)) {
+          if (typeof effect === "function") await effect();
+          else if ("dispose" in effect) await effect.dispose();
+          else if ("destroy" in effect) await effect.destroy();
+          else await effect.close();
+          throw new TypeError("The effect provider does not expose screen sprites");
+        }
+        return effect;
+      },
+      () => this.syncScreenEffects(),
+    );
+    this.textureCache = sharedTextureCache;
+    this.releaseTextureCacheLimits = this.textureCache.registerLimits(
+      Math.max(8, Math.trunc(finite(context.runtime.textureCacheEntryMax, DEFAULT_TEXTURE_CACHE_IDLE_ENTRIES))),
+      Math.max(0, finite(context.runtime.textureCacheMegabytes, DEFAULT_TEXTURE_CACHE_MEGABYTES)) * 1024 * 1024,
+    );
     this.backend = options.backend || "pixi";
     this.profile = options.profile || "vega";
     this.options = {
-      referenceWidth: positive(options.referenceWidth, 1920),
-      referenceHeight: positive(options.referenceHeight, 1080),
+      referenceWidth: positive(options.referenceWidth, this.profile === "webgal" ? 2560 : 1920),
+      referenceHeight: positive(options.referenceHeight, this.profile === "webgal" ? 1440 : 1080),
       backgroundColor: Math.trunc(finite(options.backgroundColor, 0x050713)),
       antialias: options.antialias ?? true,
       autoDensity: options.autoDensity ?? true,
@@ -325,11 +561,15 @@ export class PixiStoryScene extends GenericStoryScene {
     this.viewportWorld.addChild(this.world);
     this.world.sortableChildren = true;
     this.pixiBackgroundLayer.zIndex = 0;
+    this.pixiBackgroundEffects.zIndex = 5;
+    this.pixiBackgroundEffects.sortableChildren = true;
+    this.pixiEffectLayer.sortableChildren = true;
     this.pixiCharacterLayer.zIndex = 10;
     this.pixiStillLayer.zIndex = 20;
     this.pixiEffectLayer.zIndex = 30;
     this.world.addChild(
       this.pixiBackgroundLayer,
+      this.pixiBackgroundEffects,
       this.pixiCharacterLayer,
       this.pixiStillLayer,
       this.pixiEffectLayer,
@@ -342,16 +582,10 @@ export class PixiStoryScene extends GenericStoryScene {
     }
     await super.setup(mount);
     if (this.app) return;
-    const roots = mount.querySelectorAll<HTMLElement>(
-      '[data-vega-scene="generic"]',
-    );
+    const roots = mount.querySelectorAll<HTMLElement>('[data-vega-scene="generic"]');
     const root = roots.item(roots.length - 1);
-    if (!root)
-      throw new Error("Vega Pixi renderer could not find its stage root");
-    const resolution = Math.min(
-      this.options.maxResolution,
-      Math.max(1, finite(globalThis.devicePixelRatio, 1)),
-    );
+    if (!root) throw new Error("Vega Pixi renderer could not find its stage root");
+    const resolution = Math.min(this.options.maxResolution, Math.max(1, finite(globalThis.devicePixelRatio, 1)));
     const app = new Application({
       width: Math.max(1, root.clientWidth),
       height: Math.max(1, root.clientHeight),
@@ -361,38 +595,58 @@ export class PixiStoryScene extends GenericStoryScene {
       resolution,
       powerPreference: "high-performance",
       sharedTicker: false,
+      autoStart: false,
     });
+    const interaction = app.renderer.plugins.interaction as { useSystemTicker?: boolean } | undefined;
+    if (interaction && "useSystemTicker" in interaction) {
+      // Vega routes input through its DOM shell; Pixi has no interactive stage
+      // objects, so its global interaction ticker would only keep an idle rAF.
+      interaction.useSystemTicker = false;
+    }
     const canvas = app.view as HTMLCanvasElement;
     canvas.className = "vega-stage__pixi";
     canvas.dataset.vegaRenderer = "pixi";
-    canvas.style.cssText =
-      "position:absolute;inset:0;z-index:0;width:100%;height:100%;display:block;";
+    canvas.style.cssText = "position:absolute;inset:0;z-index:0;width:100%;height:100%;display:block;";
     root.prepend(canvas);
     root.dataset.vegaScene = "pixi";
     root.dataset.vegaPixiProfile = this.profile;
     app.stage.addChild(this.viewportWorld);
     this.pixiRoot = root;
     this.app = app;
+    this.screenSprites = new PixiScreenSpriteRenderer(this.pixiBackgroundEffects, this.pixiEffectLayer);
+    app.ticker.add(this.tickScreenEffects);
     this.resize();
     if (typeof ResizeObserver !== "undefined") {
       this.observer = new ResizeObserver(() => this.resize());
       this.observer.observe(root);
     }
+    this.requestRender();
   }
 
-  override async destroy(_options?: {
-    releaseTextures?: boolean;
-  }): Promise<void> {
-    if (this.pixiDestroyed) return;
+  override destroy(
+    options: {
+      releaseTextures?: boolean;
+    } = {},
+  ): Promise<void> {
+    if (options.releaseTextures !== false) {
+      this.releaseTexturesRequested = true;
+      this.textureCache.disposeWhenIdle(this.textureCacheKeys);
+      if (this.pixiDestroyComplete) {
+        releaseTextureIdentityOwner(this.textureCacheKeys);
+      }
+    }
+    if (this.destroyPromise) return this.destroyPromise;
     this.pixiDestroyed = true;
+    this.destroyPromise = Promise.resolve().then(() => this.destroyScene());
+    return this.destroyPromise;
+  }
+
+  private async destroyScene(): Promise<void> {
     this.lifecycleController.abort();
     this.backgroundGeneration += 1;
     this.stillGeneration += 1;
     for (const target of this.characterGenerations.keys()) {
-      this.characterGenerations.set(
-        target,
-        (this.characterGenerations.get(target) ?? 0) + 1,
-      );
+      this.characterGenerations.set(target, (this.characterGenerations.get(target) ?? 0) + 1);
     }
     this.observer?.disconnect();
     this.observer = null;
@@ -405,31 +659,43 @@ export class PixiStoryScene extends GenericStoryScene {
       this.releasePixiCharacter(character);
     }
     this.pixiCharacters.clear();
-    for (const effect of this.pixiEffects.values()) {
-      this.app?.ticker.remove(effect.tick);
-      effect.container.destroy({
-        children: true,
-        texture: false,
-        baseTexture: false,
-      });
-      effect.texture.destroy(true);
-    }
-    this.pixiEffects.clear();
+    for (const lease of this.episodeTextureLeases.values()) lease.release();
+    this.episodeTextureLeases.clear();
+    this.app?.ticker.remove(this.tickScreenEffects);
+    this.screenEffects.dispose();
+    this.screenSprites?.dispose();
+    this.screenSprites = undefined;
+    this.continuousRenderReferences = 0;
     this.clearColorMatrix();
+    // Pixi 6's prepare plugin drops queued completion callbacks when its
+    // renderer is destroyed. Let already-started GPU uploads finish first so
+    // aborted callers can safely release their shared texture leases.
+    if (this.pendingTexturePreparations.size > 0) {
+      await Promise.allSettled([...this.pendingTexturePreparations]);
+    }
     if (this.app) {
+      this.app.stop();
       this.app.destroy(true, {
         children: true,
         texture: false,
         baseTexture: false,
       });
     }
-    for (const record of this.texturePool.values()) {
-      if (record.references === 0) this.disposeTextureRecord(record);
-    }
-    this.texturePool.clear();
     this.app = null;
     this.pixiRoot = null;
-    await super.destroy();
+    try {
+      await super.destroy();
+    } finally {
+      // A destroy(false) may be upgraded while GenericStoryScene is still
+      // disposing provider models. Sweep again so that upgrade is monotonic.
+      if (this.releaseTexturesRequested) {
+        this.textureCache.disposeWhenIdle(this.textureCacheKeys);
+        releaseTextureIdentityOwner(this.textureCacheKeys);
+      }
+      this.releaseTextureCacheLimits?.();
+      this.releaseTextureCacheLimits = null;
+      this.pixiDestroyComplete = true;
+    }
   }
 
   override resize(): void {
@@ -440,51 +706,37 @@ export class PixiStoryScene extends GenericStoryScene {
     const width = Math.max(1, root.clientWidth);
     const height = Math.max(1, root.clientHeight);
     app.renderer.resize(width, height);
-    this.viewport = computePixiViewport(
-      width,
-      height,
-      this.options.referenceWidth,
-      this.options.referenceHeight,
-    );
-    this.viewportWorld.position.set(
-      this.viewport.offsetX,
-      this.viewport.offsetY,
-    );
+    this.viewport = computePixiViewport(width, height, this.options.referenceWidth, this.options.referenceHeight);
+    this.viewportWorld.position.set(this.viewport.offsetX, this.viewport.offsetY);
     this.viewportWorld.scale.set(this.viewport.scale);
     this.fitLease(this.pixiBackgroundLease, "cover");
     this.fitLease(this.pixiStillLease, "contain");
     for (const character of this.pixiCharacters.values()) {
       this.layoutCharacter(character);
     }
+    this.requestRender();
   }
 
-  capturePreview(
-    options: StoryScenePreviewOptions,
-  ): string | undefined {
+  capturePreview(options: StoryScenePreviewOptions): string | undefined {
     const app = this.app;
     const document = this.pixiRoot?.ownerDocument;
     if (!app || !document?.createElement) return undefined;
     try {
-      const source = app.renderer.plugins.extract.canvas(app.stage);
+      // Extract the rendered framebuffer. Extracting `app.stage` renders its
+      // content bounds into a transparent texture: empty margins disappear,
+      // narrow portraits are zoomed/cropped, and the stage clear colour is lost.
+      app.render();
+      const source = app.renderer.plugins.extract.canvas();
       if (!source.width || !source.height) return undefined;
       const preview = document.createElement("canvas");
       preview.width = Math.max(1, Math.round(options.width));
       preview.height = Math.max(1, Math.round(options.height));
       const context = preview.getContext("2d");
       if (!context) return undefined;
-      const scale = Math.max(
-        preview.width / source.width,
-        preview.height / source.height,
-      );
+      const scale = Math.max(preview.width / source.width, preview.height / source.height);
       const width = source.width * scale;
       const height = source.height * scale;
-      context.drawImage(
-        source,
-        (preview.width - width) / 2,
-        (preview.height - height) / 2,
-        width,
-        height,
-      );
+      context.drawImage(source, (preview.width - width) / 2, (preview.height - height) / 2, width, height);
       return preview.toDataURL(options.format, options.quality);
     } catch {
       // Extraction can fail for tainted cross-origin textures. Saving gameplay
@@ -496,11 +748,170 @@ export class PixiStoryScene extends GenericStoryScene {
   override setDeterministicReplayActive(active: boolean): void {
     super.setDeterministicReplayActive(active);
     this.pixiDeterministicReplay = Boolean(active);
+    if (active) this.app?.stop();
+    else if (this.continuousRenderReferences > 0) this.app?.start();
+    else this.requestRender();
   }
 
-  override async setBackground(
-    ...args: Parameters<GenericStoryScene["setBackground"]>
+  override createSeekSnapshot(): ReturnType<GenericStoryScene["createSeekSnapshot"]> {
+    if (!this.screenEffects.ready) return null;
+    const snapshot = super.createSeekSnapshot();
+    if (!snapshot) return null;
+    const presentation: PixiSeekPresentation = {
+      version: 1,
+      world: [
+        this.world.x,
+        this.world.y,
+        this.world.scale.x,
+        this.world.scale.y,
+        this.world.pivot.x,
+        this.world.pivot.y,
+        this.world.rotation,
+        this.world.alpha,
+      ],
+      colorMatrix: this.colorMatrixFilter ? Array.from(this.colorMatrixFilter.matrix) : null,
+      screenEffects: this.screenEffects.snapshot(),
+      characters: [...this.pixiCharacters.values()].map((character) => ({
+        target: character.target,
+        positionType: character.positionType,
+        brightness: character.brightness,
+        blur: character.blur,
+        offsetX: character.offsetX,
+        offsetY: character.offsetY,
+        worldPosition: character.worldPosition ? { ...character.worldPosition } : null,
+        alpha: character.sprite.alpha,
+        angle: character.sprite.angle,
+      })),
+    };
+    return { ...snapshot, rendererState: { ...object(snapshot.rendererState), pixi: presentation } };
+  }
+
+  override async restoreSeekSnapshot(
+    snapshot: Parameters<GenericStoryScene["restoreSeekSnapshot"]>[0],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted || this.pixiDestroyed) return;
+    this.cancelAllAnimations();
+    await super.restoreSeekSnapshot(snapshot);
+    if (signal?.aborted || this.pixiDestroyed) return;
+    const presentation = object(snapshot.rendererState).pixi as PixiSeekPresentation | undefined;
+    this.clearScreenEffects();
+    this.clearColorMatrix();
+    if (presentation?.version !== 1) {
+      this.setWorldTransform({});
+      return;
+    }
+    const [x, y, sx, sy, px, py, rotation, alpha] = presentation.world;
+    this.world.position.set(x, y);
+    this.world.scale.set(sx, sy);
+    this.world.pivot.set(px, py);
+    this.world.rotation = rotation;
+    this.world.alpha = alpha;
+    if (presentation.colorMatrix) this.applyColorMatrix(presentation.colorMatrix);
+    const targets = new Set(presentation.characters.map((character) => character.target));
+    for (const [target, character] of this.pixiCharacters) {
+      if (targets.has(target)) continue;
+      this.releasePixiCharacter(character);
+      this.pixiCharacters.delete(target);
+    }
+    for (const saved of presentation.characters) {
+      const character = this.pixiCharacters.get(saved.target);
+      if (!character) continue;
+      character.positionType = saved.positionType;
+      character.brightness = saved.brightness;
+      character.blur = saved.blur;
+      character.offsetX = saved.offsetX;
+      character.offsetY = saved.offsetY;
+      character.worldPosition = saved.worldPosition ? { ...saved.worldPosition } : null;
+      character.sprite.alpha = saved.alpha;
+      character.sprite.angle = saved.angle;
+      character.sprite.tint = tintFromBrightness(saved.brightness);
+      this.setBlur(character.sprite, saved.blur);
+      this.layoutCharacter(character);
+    }
+    await this.screenEffects.restore(presentation.screenEffects ?? [], signal);
+    this.requestRender();
+  }
+
+  cancelTransitionsForSeek(): void {
+    this.cancelAllAnimations();
+  }
+
+  presentSeekSnapshot(): void {
+    if (!this.pixiDestroyed) this.app?.render();
+  }
+
+  override async preloadTexture(url: string, signal?: AbortSignal): Promise<Readonly<Uint8Array>> {
+    if (!url) throw new Error("Cannot load an empty Pixi texture URL");
+    const linked = linkSignals([this.context.signal, this.lifecycleController.signal, signal]);
+    const domReady = super.preloadTexture(url, linked.signal);
+    // Keep the parallel DOM fallback preparation observed even if Pixi fails
+    // first, so an aborted preload never creates an unhandled rejection.
+    void domReady.catch(() => undefined);
+    let lease: SharedPixiTextureLease<PixiTextureResource> | undefined;
+    let identity: PixiTextureIdentity | undefined;
+    try {
+      // Pixi owns its decoded/GPU texture lifetime. Read canonical bytes in
+      // parallel with the DOM fallback decode so either rendering path is
+      // ready before the episode leaves its loading screen.
+      const sharedBytes = this.context.resources.loadSharedBytes;
+      const bytes = await (sharedBytes
+        ? sharedBytes.call(this.context.resources, url, linked.signal)
+        : this.context.resources.load(url, linked.signal));
+      identity = textureIdentityFor(url, this.context.resources, bytes, Boolean(sharedBytes));
+      const resident = this.episodeTextureLeases.get(identity);
+      if (resident) {
+        await withAbort(this.texturePreparation(resident.value.texture), linked.signal);
+        await domReady;
+        return bytes;
+      }
+      lease = await this.textureCache.acquire(identity, linked.signal);
+      trackTextureIdentity(identity, this.textureCacheKeys);
+      if (linked.signal.aborted) throw abortReason(linked.signal);
+      const preparation = this.texturePreparation(lease.value.texture);
+      await withAbort(preparation, linked.signal);
+      if (linked.signal.aborted) throw abortReason(linked.signal);
+      const raced = this.episodeTextureLeases.get(identity);
+      if (raced) {
+        lease.release();
+      } else {
+        this.episodeTextureLeases.set(identity, lease);
+      }
+      lease = undefined;
+      await domReady;
+      return bytes;
+    } finally {
+      if (lease) {
+        this.releaseTextureLeaseAfterPreparation(lease, this.texturePreparations.get(lease.value.texture));
+      }
+      if (identity && this.releaseTexturesRequested) {
+        this.textureCache.disposeWhenIdle([identity]);
+      }
+      if (identity && !lease && !this.textureCache.has(identity)) {
+        forgetTextureIdentity(identity);
+      }
+      linked.release();
+    }
+  }
+
+  override loadTexture(url: string, signal?: AbortSignal): Promise<Readonly<Uint8Array>> {
+    return this.preloadTexture(url, signal);
+  }
+
+  override async preloadCharacter(
+    request: Parameters<GenericStoryScene["preloadCharacter"]>[0],
+    signal?: AbortSignal,
   ): Promise<boolean> {
+    const portableReady = super.preloadCharacter(request, signal);
+    const source = pixiStaticCharacterSource(request.command.characterModel);
+    if (!source) return portableReady;
+    // Generic prepares the portable DOM controller; retain the matching Pixi
+    // GPU texture as well so sprite selection has no first-use upload.
+    const [ready] = await Promise.all([portableReady, this.preloadTexture(source, signal)]);
+    return ready;
+  }
+
+  override async setBackground(...args: Parameters<GenericStoryScene["setBackground"]>): Promise<boolean> {
     const generation = ++this.backgroundGeneration;
     const result = await super.setBackground(...args);
     if (generation !== this.backgroundGeneration || this.pixiDestroyed) {
@@ -514,10 +925,7 @@ export class PixiStoryScene extends GenericStoryScene {
       this.showDomLayer("background");
       return result;
     }
-    const lease = await this.createSpriteLease(
-      source,
-      args[3] ?? this.context.signal,
-    );
+    const lease = await this.createSpriteLease(source, args[3] ?? this.context.signal);
     if (generation !== this.backgroundGeneration || this.pixiDestroyed) {
       this.releasePixiLease(lease);
       return result;
@@ -530,12 +938,11 @@ export class PixiStoryScene extends GenericStoryScene {
     this.setBlur(lease.sprite, this.pixiBackgroundBlur);
     this.fitLease(lease, "cover");
     this.hideDomLayer("background");
+    this.requestRender();
     return result;
   }
 
-  override async setStill(
-    ...args: Parameters<GenericStoryScene["setStill"]>
-  ): Promise<void> {
+  override async setStill(...args: Parameters<GenericStoryScene["setStill"]>): Promise<void> {
     const generation = ++this.stillGeneration;
     await super.setStill(...args);
     if (generation !== this.stillGeneration || this.pixiDestroyed) return;
@@ -559,11 +966,10 @@ export class PixiStoryScene extends GenericStoryScene {
     this.pixiStillLease = lease;
     this.fitLease(lease, "contain");
     this.hideDomLayer("still");
+    this.requestRender();
   }
 
-  override async clearStill(
-    ...args: Parameters<GenericStoryScene["clearStill"]>
-  ): Promise<void> {
+  override async clearStill(...args: Parameters<GenericStoryScene["clearStill"]>): Promise<void> {
     const generation = ++this.stillGeneration;
     await super.clearStill(...args);
     if (generation !== this.stillGeneration || this.pixiDestroyed) return;
@@ -572,43 +978,23 @@ export class PixiStoryScene extends GenericStoryScene {
     this.showDomLayer("still");
   }
 
-  override async fadeStill(
-    ...args: Parameters<GenericStoryScene["fadeStill"]>
-  ): Promise<void> {
+  override async fadeStill(...args: Parameters<GenericStoryScene["fadeStill"]>): Promise<void> {
     const lease = this.pixiStillLease;
     const animation = lease
-      ? this.animateNumber(
-          "still:alpha",
-          lease.sprite.alpha,
-          clamp(args[0]),
-          finite(args[1]),
-          (value) => {
-            if (this.pixiStillLease === lease) lease.sprite.alpha = value;
-          },
-        )
+      ? this.animateNumber("still:alpha", lease.sprite.alpha, clamp(args[0]), finite(args[1]), (value) => {
+          if (this.pixiStillLease === lease) lease.sprite.alpha = value;
+        })
       : Promise.resolve();
     await Promise.all([super.fadeStill(...args), animation]);
   }
 
-  override async placeCharacter(
-    ...args: Parameters<GenericStoryScene["placeCharacter"]>
-  ): Promise<void> {
+  override async placeCharacter(...args: Parameters<GenericStoryScene["placeCharacter"]>): Promise<void> {
     const [command, positionType] = args;
-    const target = firstString(
-      command.targetName,
-      command.targets?.[0]?.target,
-      command.characterKey,
-    );
-    const generation = target
-      ? (this.characterGenerations.get(target) ?? 0) + 1
-      : 0;
+    const target = firstString(command.targetName, command.targets?.[0]?.target, command.characterKey);
+    const generation = target ? (this.characterGenerations.get(target) ?? 0) + 1 : 0;
     if (target) this.characterGenerations.set(target, generation);
     await super.placeCharacter(...args);
-    if (
-      !target ||
-      generation !== this.characterGenerations.get(target) ||
-      this.pixiDestroyed
-    ) {
+    if (!target || generation !== this.characterGenerations.get(target) || this.pixiDestroyed) {
       return;
     }
     const previous = this.pixiCharacters.get(target);
@@ -627,10 +1013,7 @@ export class PixiStoryScene extends GenericStoryScene {
       return;
     }
     const lease = await this.createSpriteLease(source, this.context.signal);
-    if (
-      generation !== this.characterGenerations.get(target) ||
-      this.pixiDestroyed
-    ) {
+    if (generation !== this.characterGenerations.get(target) || this.pixiDestroyed) {
       this.releasePixiLease(lease);
       return;
     }
@@ -660,34 +1043,21 @@ export class PixiStoryScene extends GenericStoryScene {
     this.pixiCharacterLayer.addChild(character.sprite);
     this.layoutCharacter(character);
     this.hideDomCharacter(target);
+    this.requestRender();
   }
 
-  override async removeCharacter(
-    ...args: Parameters<GenericStoryScene["removeCharacter"]>
-  ): Promise<boolean> {
+  override async removeCharacter(...args: Parameters<GenericStoryScene["removeCharacter"]>): Promise<boolean> {
     const target = args[0];
-    this.characterGenerations.set(
-      target,
-      (this.characterGenerations.get(target) ?? 0) + 1,
-    );
+    this.characterGenerations.set(target, (this.characterGenerations.get(target) ?? 0) + 1);
     const character = this.pixiCharacters.get(target);
     const animation = character
-      ? this.animateNumber(
-          `character:${target}:alpha`,
-          character.sprite.alpha,
-          0,
-          finite(args[1]),
-          (value) => {
-            if (this.pixiCharacters.get(target) === character) {
-              character.sprite.alpha = value;
-            }
-          },
-        )
+      ? this.animateNumber(`character:${target}:alpha`, character.sprite.alpha, 0, finite(args[1]), (value) => {
+          if (this.pixiCharacters.get(target) === character) {
+            character.sprite.alpha = value;
+          }
+        })
       : Promise.resolve();
-    const [result] = await Promise.all([
-      super.removeCharacter(...args),
-      animation,
-    ]);
+    const [result] = await Promise.all([super.removeCharacter(...args), animation]);
     if (character) {
       this.cancelAnimations(`character:${target}:`);
       this.releasePixiCharacter(character);
@@ -697,9 +1067,7 @@ export class PixiStoryScene extends GenericStoryScene {
     return result;
   }
 
-  override async fadeCharacter(
-    ...args: Parameters<GenericStoryScene["fadeCharacter"]>
-  ): Promise<void> {
+  override async fadeCharacter(...args: Parameters<GenericStoryScene["fadeCharacter"]>): Promise<void> {
     const character = this.pixiCharacters.get(args[0]);
     const animation = character
       ? this.animateNumber(
@@ -717,9 +1085,7 @@ export class PixiStoryScene extends GenericStoryScene {
     await Promise.all([super.fadeCharacter(...args), animation]);
   }
 
-  override async moveCharacter(
-    ...args: Parameters<GenericStoryScene["moveCharacter"]>
-  ): Promise<void> {
+  override async moveCharacter(...args: Parameters<GenericStoryScene["moveCharacter"]>): Promise<void> {
     await super.moveCharacter(...args);
     const [positionType, offset] = args;
     for (const character of this.pixiCharacters.values()) {
@@ -729,11 +1095,10 @@ export class PixiStoryScene extends GenericStoryScene {
       character.offsetY += finite(offset.y);
       this.layoutCharacter(character);
     }
+    this.requestRender();
   }
 
-  override async moveCharacterToWorld(
-    ...args: Parameters<GenericStoryScene["moveCharacterToWorld"]>
-  ): Promise<void> {
+  override async moveCharacterToWorld(...args: Parameters<GenericStoryScene["moveCharacterToWorld"]>): Promise<void> {
     await super.moveCharacterToWorld(...args);
     const [target, destination, positionType] = args;
     const character = this.pixiCharacters.get(target);
@@ -744,11 +1109,10 @@ export class PixiStoryScene extends GenericStoryScene {
       y: finite(destination.y),
     };
     this.layoutCharacter(character);
+    this.requestRender();
   }
 
-  override async setCharacterAngle(
-    ...args: Parameters<GenericStoryScene["setCharacterAngle"]>
-  ): Promise<void> {
+  override async setCharacterAngle(...args: Parameters<GenericStoryScene["setCharacterAngle"]>): Promise<void> {
     const character = this.pixiCharacters.get(args[0]);
     const destination = finite(args[1]) + finite(args[2]);
     const animation = character
@@ -767,9 +1131,7 @@ export class PixiStoryScene extends GenericStoryScene {
     await Promise.all([super.setCharacterAngle(...args), animation]);
   }
 
-  override async setBrightness(
-    ...args: Parameters<GenericStoryScene["setBrightness"]>
-  ): Promise<void> {
+  override async setBrightness(...args: Parameters<GenericStoryScene["setBrightness"]>): Promise<void> {
     const character = this.pixiCharacters.get(args[0]);
     const destination = clamp(args[1]);
     const animation = character
@@ -788,30 +1150,20 @@ export class PixiStoryScene extends GenericStoryScene {
     await Promise.all([super.setBrightness(...args), animation]);
   }
 
-  override async setCharacterDoF(
-    ...args: Parameters<GenericStoryScene["setCharacterDoF"]>
-  ): Promise<void> {
+  override async setCharacterDoF(...args: Parameters<GenericStoryScene["setCharacterDoF"]>): Promise<void> {
     const character = this.pixiCharacters.get(args[0]);
     const destination = clamp(args[1]);
     const animation = character
-      ? this.animateNumber(
-          `character:${args[0]}:blur`,
-          character.blur,
-          destination,
-          finite(args[2]),
-          (value) => {
-            if (this.pixiCharacters.get(args[0]) !== character) return;
-            character.blur = value;
-            this.setBlur(character.sprite, value);
-          },
-        )
+      ? this.animateNumber(`character:${args[0]}:blur`, character.blur, destination, finite(args[2]), (value) => {
+          if (this.pixiCharacters.get(args[0]) !== character) return;
+          character.blur = value;
+          this.setBlur(character.sprite, value);
+        })
       : Promise.resolve();
     await Promise.all([super.setCharacterDoF(...args), animation]);
   }
 
-  override async setBackgroundDoF(
-    ...args: Parameters<GenericStoryScene["setBackgroundDoF"]>
-  ): Promise<void> {
+  override async setBackgroundDoF(...args: Parameters<GenericStoryScene["setBackgroundDoF"]>): Promise<void> {
     const lease = this.pixiBackgroundLease;
     const destination = clamp(args[0]);
     const animation = this.animateNumber(
@@ -853,15 +1205,12 @@ export class PixiStoryScene extends GenericStoryScene {
     return Object.freeze({
       renderer: "pixi",
       profile: this.profile,
-      referenceSize: [
-        this.options.referenceWidth,
-        this.options.referenceHeight,
-      ] as const,
+      referenceSize: [this.options.referenceWidth, this.options.referenceHeight] as const,
       viewport: { ...this.viewport },
       characters: [...this.pixiCharacters.keys()].sort(),
       background: Boolean(this.pixiBackgroundLease),
       still: Boolean(this.pixiStillLease),
-      effects: [...this.pixiEffects.keys()].sort(),
+      effects: [...this.screenEffects.keys].sort(),
     });
   }
 
@@ -872,143 +1221,18 @@ export class PixiStoryScene extends GenericStoryScene {
     readonly rotationDegrees?: number;
   }): void {
     const scale = positive(transform.scale, 1);
-    this.world.pivot.set(
-      this.options.referenceWidth / 2,
-      this.options.referenceHeight / 2,
-    );
+    this.world.pivot.set(this.options.referenceWidth / 2, this.options.referenceHeight / 2);
     this.world.position.set(
       this.options.referenceWidth * 0.5 + finite(transform.x),
       this.options.referenceHeight * 0.5 + finite(transform.y),
     );
     this.world.scale.set(scale);
     this.world.rotation = (finite(transform.rotationDegrees) * Math.PI) / 180;
-  }
-
-  setAmbientEffect(
-    effect: PixiAmbientEffect,
-    options: PixiAmbientEffectOptions = {},
-  ): void {
-    this.clearAmbientEffect(effect);
-    if (!this.app) return;
-    const count = Math.max(
-      1,
-      Math.min(
-        512,
-        Math.trunc(finite(options.count, effect === "rain" ? 120 : 72)),
-      ),
-    );
-    const speed = positive(
-      options.speed,
-      effect === "rain" ? 24 : effect === "snow" ? 3.2 : 2.4,
-    );
-    const alpha =
-      options.alpha === undefined ? 0.72 : clamp(options.alpha, 0, 1);
-    const color =
-      Math.trunc(
-        finite(options.color, effect === "petals" ? 0xffb7cc : 0xffffff),
-      ) & 0xffffff;
-    let seed = Math.trunc(finite(options.seed, 0x51a7e)) >>> 0;
-    const random = () => {
-      seed = (Math.imul(seed ^ (seed >>> 15), seed | 1) + 0x6d2b79f5) >>> 0;
-      return ((seed ^ (seed >>> 14)) >>> 0) / 4294967296;
-    };
-    const container = new Container();
-    container.name = `vega-pixi-effect:${effect}`;
-    const glyph = new Graphics();
-    glyph.beginFill(0xffffff);
-    if (effect === "rain") {
-      glyph.drawRoundedRect(-1, -12, 2, 24, 1);
-    } else if (effect === "snow") {
-      glyph.drawCircle(0, 0, 4);
-    } else {
-      glyph.drawEllipse(0, 0, 5, 3);
-    }
-    glyph.endFill();
-    const texture = this.app.renderer.generateTexture(glyph, {
-      resolution: 1,
-    });
-    glyph.destroy();
-    const particleContainer = new ParticleContainer(
-      count,
-      {
-        position: true,
-        rotation: true,
-        vertices: true,
-        tint: true,
-      },
-      Math.min(count, 512),
-    );
-    container.addChild(particleContainer);
-    const particles: Array<{
-      readonly sprite: Sprite;
-      readonly velocityX: number;
-      readonly velocityY: number;
-      readonly spin: number;
-    }> = [];
-    for (let index = 0; index < count; index += 1) {
-      const sprite = new Sprite(texture);
-      sprite.anchor.set(0.5);
-      sprite.tint = color;
-      sprite.alpha = alpha * (0.5 + random() * 0.5);
-      sprite.scale.set(
-        effect === "rain" ? 0.7 + random() * 0.8 : 0.45 + random() * 0.9,
-      );
-      sprite.position.set(
-        random() * this.options.referenceWidth,
-        random() * this.options.referenceHeight,
-      );
-      sprite.rotation = random() * Math.PI * 2;
-      particleContainer.addChild(sprite);
-      particles.push({
-        sprite,
-        velocityX: effect === "rain" ? -speed * 0.18 : (random() - 0.5) * speed,
-        velocityY: effect === "rain" ? speed : speed * (0.55 + random() * 0.8),
-        spin: (random() - 0.5) * 0.04,
-      });
-    }
-    const tick = (delta: number) => {
-      for (const particle of particles) {
-        particle.sprite.x += particle.velocityX * delta;
-        particle.sprite.y += particle.velocityY * delta;
-        particle.sprite.rotation += particle.spin * delta;
-        if (particle.sprite.y > this.options.referenceHeight + 32) {
-          particle.sprite.y = -32;
-          particle.sprite.x = random() * this.options.referenceWidth;
-        }
-        if (particle.sprite.x < -32) {
-          particle.sprite.x = this.options.referenceWidth + 32;
-        }
-        if (particle.sprite.x > this.options.referenceWidth + 32) {
-          particle.sprite.x = -32;
-        }
-      }
-    };
-    this.pixiEffects.set(effect, { container, tick, texture });
-    this.pixiEffectLayer.addChild(container);
-    this.app.ticker.add(tick);
-  }
-
-  clearAmbientEffect(effect?: PixiAmbientEffect): void {
-    const targets = effect ? [effect] : [...this.pixiEffects.keys()];
-    for (const target of targets) {
-      const instance = this.pixiEffects.get(target);
-      if (!instance) continue;
-      this.app?.ticker.remove(instance.tick);
-      instance.container.destroy({
-        children: true,
-        texture: false,
-        baseTexture: false,
-      });
-      instance.texture.destroy(true);
-      this.pixiEffects.delete(target);
-    }
+    this.requestRender();
   }
 
   applyColorMatrix(values: readonly number[]): void {
-    if (
-      values.length !== 20 ||
-      values.some((value) => !Number.isFinite(value))
-    ) {
+    if (values.length !== 20 || values.some((value) => !Number.isFinite(value))) {
       throw new TypeError("A Pixi color matrix must contain 20 finite values");
     }
     const filter = this.colorMatrixFilter ?? new ColorMatrixFilter();
@@ -1017,16 +1241,46 @@ export class PixiStoryScene extends GenericStoryScene {
     if (!(this.world.filters ?? []).includes(filter)) {
       this.world.filters = [...(this.world.filters ?? []), filter];
     }
+    this.requestRender();
   }
 
   clearColorMatrix(): void {
     const filter = this.colorMatrixFilter;
     if (!filter) return;
-    this.world.filters = (this.world.filters ?? []).filter(
-      (candidate) => candidate !== filter,
-    );
+    this.world.filters = (this.world.filters ?? []).filter((candidate) => candidate !== filter);
     filter.destroy();
     this.colorMatrixFilter = null;
+    this.requestRender();
+  }
+
+  protected requestRender(): void {
+    const app = this.app;
+    if (!app || this.pixiDestroyed || this.pixiDeterministicReplay || app.ticker.started || this.renderQueued) {
+      return;
+    }
+    this.renderQueued = true;
+    queueMicrotask(() => {
+      this.renderQueued = false;
+      const current = this.app;
+      if (!current || this.pixiDestroyed || this.pixiDeterministicReplay || current.ticker.started) return;
+      current.render();
+    });
+  }
+
+  protected retainContinuousRender(): () => void {
+    const app = this.app;
+    if (!app || this.pixiDestroyed) return () => undefined;
+    this.continuousRenderReferences += 1;
+    if (!this.pixiDeterministicReplay) app.start();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.continuousRenderReferences = Math.max(0, this.continuousRenderReferences - 1);
+      if (this.continuousRenderReferences !== 0 || this.app !== app) return;
+      app.stop();
+      this.requestRender();
+    };
   }
 
   private animateNumber(
@@ -1041,12 +1295,14 @@ export class PixiStoryScene extends GenericStoryScene {
     const duration = Math.max(0, finite(durationSeconds));
     if (!app || this.pixiDeterministicReplay || duration === 0) {
       update(to);
+      this.requestRender();
       return Promise.resolve();
     }
     return new Promise((resolve) => {
       let elapsed = 0;
       let settled = false;
       let animation: PixiAnimation;
+      let releaseContinuousRender: () => void = () => undefined;
       const finish = (complete: boolean) => {
         if (settled) return;
         settled = true;
@@ -1057,6 +1313,7 @@ export class PixiStoryScene extends GenericStoryScene {
           this.animations.delete(key);
         }
         if (complete) update(to);
+        releaseContinuousRender();
         resolve();
       };
       const cancel = () => finish(false);
@@ -1073,6 +1330,10 @@ export class PixiStoryScene extends GenericStoryScene {
       });
       this.context.signal.addEventListener("abort", cancel, { once: true });
       app.ticker.add(tick);
+      releaseContinuousRender = this.retainContinuousRender();
+      if (this.lifecycleController.signal.aborted || this.context.signal.aborted) {
+        cancel();
+      }
     });
   }
 
@@ -1088,46 +1349,44 @@ export class PixiStoryScene extends GenericStoryScene {
     }
   }
 
-  private async createSpriteLease(
-    source: string,
-    externalSignal?: AbortSignal,
-  ): Promise<PixiLease> {
-    const linked = linkSignals([
-      this.context.signal,
-      this.lifecycleController.signal,
-      externalSignal,
-    ]);
-    let renderable:
-      { readonly url: string; readonly release: () => void } | undefined;
-    let record: PixiTextureRecord | undefined;
+  private async createSpriteLease(source: string, externalSignal?: AbortSignal): Promise<PixiLease> {
+    const linked = linkSignals([this.context.signal, this.lifecycleController.signal, externalSignal]);
+    let textureLease: SharedPixiTextureLease<PixiTextureResource> | undefined;
+    let identity: PixiTextureIdentity | undefined;
     try {
-      renderable = await this.context.resources.resolveRenderable(
-        source,
-        linked.signal,
-      );
+      const sharedBytes = this.context.resources.loadSharedBytes;
+      const bytes = await (sharedBytes
+        ? sharedBytes.call(this.context.resources, source, linked.signal)
+        : this.context.resources.load(source, linked.signal));
+      identity = textureIdentityFor(source, this.context.resources, bytes, Boolean(sharedBytes));
+      textureLease = await this.textureCache.acquire(identity, linked.signal);
+      trackTextureIdentity(identity, this.textureCacheKeys);
       if (linked.signal.aborted) throw abortReason(linked.signal);
-      record = this.acquireTextureRecord(renderable.url);
-      await withAbort(record.ready, linked.signal);
+      const preparation = this.texturePreparation(textureLease.value.texture);
+      await withAbort(preparation, linked.signal);
       if (linked.signal.aborted) throw abortReason(linked.signal);
-      const sprite = new Sprite(record.texture);
+      const sprite = new Sprite(textureLease.value.texture);
       let released = false;
       return {
         sprite,
         release: () => {
           if (released) return;
           released = true;
-          try {
-            renderable?.release();
-          } finally {
-            this.releaseTextureRecord(record);
-          }
+          textureLease?.release();
         },
       };
     } catch (error) {
-      try {
-        renderable?.release();
-      } finally {
-        this.releaseTextureRecord(record);
+      if (textureLease) {
+        this.releaseTextureLeaseAfterPreparation(
+          textureLease,
+          this.texturePreparations.get(textureLease.value.texture),
+        );
+      }
+      if (identity && this.releaseTexturesRequested) {
+        this.textureCache.disposeWhenIdle([identity]);
+      }
+      if (identity && !textureLease && !this.textureCache.has(identity)) {
+        forgetTextureIdentity(identity);
       }
       throw error;
     } finally {
@@ -1135,115 +1394,107 @@ export class PixiStoryScene extends GenericStoryScene {
     }
   }
 
-  private acquireTextureRecord(url: string): PixiTextureRecord {
-    const pooled = this.texturePool.get(url);
-    if (pooled && !pooled.disposed) {
-      pooled.references += 1;
-      return pooled;
+  private texturePreparation(texture: Texture): Promise<void> {
+    const app = this.app;
+    if (!app || this.pixiDestroyed) {
+      throw new Error("Pixi renderer must be set up before loading textures");
     }
-    // Construct a private texture instead of borrowing Pixi's process-global
-    // URL cache. This scene can then release it without invalidating another
-    // Pixi application that happens to use the same URL.
-    const texture = new Texture(new BaseTexture(url));
-    const record: PixiTextureRecord = {
-      texture,
-      ready: waitForTexture(texture),
-      references: 1,
-      disposed: false,
-    };
-    this.texturePool.set(url, record);
-    void record.ready
-      .catch(() => undefined)
-      .finally(() => {
-        if (record.references === 0) this.disposeTextureRecord(record);
-      });
-    return record;
+    const existing = this.texturePreparations.get(texture);
+    if (existing) return existing;
+    const prepare = app.renderer.plugins.prepare;
+    const pending = pixiPrepareSupportsPromise
+      ? Promise.resolve(prepare.upload(texture))
+      : new Promise<void>((resolve, reject) => {
+          try {
+            // Pixi 6.3-6.4 only expose the callback API. Keep that peer-range
+            // fallback isolated so 6.5+ never invokes its deprecated overload.
+            (prepare as unknown as LegacyPixiPrepare).upload(texture, resolve);
+          } catch (error) {
+            reject(error);
+          }
+        });
+    this.texturePreparations.set(texture, pending);
+    this.pendingTexturePreparations.add(pending);
+    void pending.then(
+      () => {
+        this.pendingTexturePreparations.delete(pending);
+      },
+      () => {
+        this.pendingTexturePreparations.delete(pending);
+        if (this.texturePreparations.get(texture) === pending) {
+          this.texturePreparations.delete(texture);
+        }
+      },
+    );
+    return pending;
   }
 
-  private releaseTextureRecord(record?: PixiTextureRecord): void {
-    if (!record || record.references <= 0) return;
-    record.references -= 1;
-    if (record.references !== 0) return;
-    void record.ready
-      .catch(() => undefined)
-      .finally(() => this.disposeTextureRecord(record));
-  }
-
-  private disposeTextureRecord(record: PixiTextureRecord): void {
-    if (record.references !== 0 || record.disposed) return;
-    record.disposed = true;
-    for (const [url, candidate] of this.texturePool) {
-      if (candidate !== record) continue;
-      this.texturePool.delete(url);
+  private releaseTextureLeaseAfterPreparation(
+    lease: SharedPixiTextureLease<PixiTextureResource>,
+    preparation?: Promise<void>,
+  ): void {
+    if (!preparation) {
+      lease.release();
+      return;
     }
-    record.texture.destroy(true);
+    void preparation.then(
+      () => lease.release(),
+      () => lease.release(),
+    );
   }
 
-  private fitLease(lease: PixiLease | null, mode: "cover" | "contain"): void {
+  protected fitLease(lease: PixiLease | null, mode: "cover" | "contain"): void {
     if (!lease) return;
-    const width = positive(
-      lease.sprite.texture.width,
-      this.options.referenceWidth,
-    );
-    const height = positive(
-      lease.sprite.texture.height,
-      this.options.referenceHeight,
-    );
+    const width = positive(lease.sprite.texture.width, this.options.referenceWidth);
+    const height = positive(lease.sprite.texture.height, this.options.referenceHeight);
     const scale =
       mode === "cover"
-        ? Math.max(
-            this.options.referenceWidth / width,
-            this.options.referenceHeight / height,
-          )
-        : Math.min(
-            this.options.referenceWidth / width,
-            this.options.referenceHeight / height,
-          );
-    lease.sprite.position.set(
-      this.options.referenceWidth / 2,
-      this.options.referenceHeight / 2,
-    );
+        ? Math.max(this.options.referenceWidth / width, this.options.referenceHeight / height)
+        : Math.min(this.options.referenceWidth / width, this.options.referenceHeight / height);
+    lease.sprite.position.set(this.options.referenceWidth / 2, this.options.referenceHeight / 2);
     lease.sprite.scale.set(scale);
   }
 
-  private layoutCharacter(character: PixiCharacter): void {
+  protected layoutCharacter(character: PixiCharacter): void {
+    if (this.profile === "webgal") {
+      const layout = computeWebGalLayout({
+        stageWidth: this.options.referenceWidth,
+        stageHeight: this.options.referenceHeight,
+        width: character.sprite.texture.width,
+        height: character.sprite.texture.height,
+        position: character.positionType === 1 ? "left" : character.positionType === 9 ? "right" : "center",
+      });
+      character.sprite.anchor.set(0.5);
+      character.sprite.position.set(layout.x + character.offsetX * 96, layout.y - character.offsetY * 54);
+      character.sprite.scale.set(layout.scale);
+      return;
+    }
     const point = this.stagePoint(character.positionType);
-    const stageWidth = Math.max(
-      0.001,
-      finite(this.context.runtime.stage.width, 3.2),
-    );
+    const stageWidth = Math.max(0.001, finite(this.context.runtime.stage.width, 3.2));
     const unitX = (this.options.referenceWidth * 0.84) / stageWidth;
     const unitY = (this.options.referenceHeight * 0.84) / stageWidth;
     const x = character.worldPosition
       ? this.options.referenceWidth / 2 + character.worldPosition.x * unitX
       : this.options.referenceWidth / 2 +
-        (point.x /
-          Math.max(0.001, finite(this.context.runtime.stage.maxX, 1.6))) *
+        (point.x / Math.max(0.001, finite(this.context.runtime.stage.maxX, 1.6))) *
           (this.options.referenceWidth * 0.42) +
         character.offsetX * unitX;
     const y = character.worldPosition
       ? this.options.referenceHeight - character.worldPosition.y * unitY
       : this.options.referenceHeight - character.offsetY * unitY;
-    const sourceHeight = positive(
-      character.sprite.texture.height,
-      this.options.referenceHeight,
-    );
+    const sourceHeight = positive(character.sprite.texture.height, this.options.referenceHeight);
     const scale = (this.options.referenceHeight * 0.94) / sourceHeight;
     character.sprite.position.set(x, y);
     character.sprite.scale.set(scale);
   }
 
   private hideDomLayer(name: string): void {
-    const layer = this.pixiRoot?.querySelector<HTMLElement>(
-      `[data-vega-layer="${name}"]`,
-    );
+    const layer = this.pixiRoot?.querySelector<HTMLElement>(`[data-vega-layer="${name}"]`);
     if (layer) layer.style.visibility = "hidden";
   }
 
   private showDomLayer(name: string): void {
-    const layer = this.pixiRoot?.querySelector<HTMLElement>(
-      `[data-vega-layer="${name}"]`,
-    );
+    const layer = this.pixiRoot?.querySelector<HTMLElement>(`[data-vega-layer="${name}"]`);
     if (layer) layer.style.removeProperty("visibility");
   }
 
@@ -1258,21 +1509,14 @@ export class PixiStoryScene extends GenericStoryScene {
   }
 
   private domCharacter(target: string): HTMLElement | null {
-    const escaped =
-      globalThis.CSS?.escape?.(target) ??
-      target.replace(/["\\]/gu, (character) => `\\${character}`);
-    return (
-      this.pixiRoot?.querySelector<HTMLElement>(
-        `[data-vega-character="${escaped}"]`,
-      ) ?? null
-    );
+    const escaped = globalThis.CSS?.escape?.(target) ?? target.replace(/["\\]/gu, (character) => `\\${character}`);
+    return this.pixiRoot?.querySelector<HTMLElement>(`[data-vega-character="${escaped}"]`) ?? null;
   }
 
   private setBlur(sprite: Sprite, intensity: number): void {
     const filters = sprite.filters ?? [];
     const existing = filters.find(
-      (candidate): candidate is InstanceType<typeof BlurFilter> =>
-        candidate instanceof BlurFilter,
+      (candidate): candidate is InstanceType<typeof BlurFilter> => candidate instanceof BlurFilter,
     );
     if (intensity <= 0) {
       if (!existing) return;
@@ -1291,6 +1535,7 @@ export class PixiStoryScene extends GenericStoryScene {
   private releasePixiLease(lease: PixiLease | null): void {
     if (!lease) return;
     try {
+      this.setBlur(lease.sprite, 0);
       lease.sprite.destroy({
         children: true,
         texture: false,
@@ -1298,11 +1543,13 @@ export class PixiStoryScene extends GenericStoryScene {
       });
     } finally {
       lease.release();
+      this.requestRender();
     }
   }
 
   private releasePixiCharacter(character: PixiCharacter): void {
     try {
+      this.setBlur(character.sprite, 0);
       character.sprite.destroy({
         children: true,
         texture: false,
@@ -1310,13 +1557,12 @@ export class PixiStoryScene extends GenericStoryScene {
       });
     } finally {
       character.lease();
+      this.requestRender();
     }
   }
 }
 
-export const createPixiRendererPlugin = (
-  options: PixiRendererOptions = {},
-): VegaPlugin =>
+export const createPixiRendererPlugin = (options: PixiRendererOptions = {}): VegaPlugin =>
   defineVegaPlugin({
     manifest: {
       id: "haneoka.renderer-pixi",
