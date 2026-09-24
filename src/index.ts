@@ -707,6 +707,14 @@ export class PixiStoryScene extends GenericStoryScene {
     const height = Math.max(1, root.clientHeight);
     app.renderer.resize(width, height);
     this.viewport = computePixiViewport(width, height, this.options.referenceWidth, this.options.referenceHeight);
+    Object.assign(this.context.state.viewport, {
+      x: this.viewport.offsetX,
+      y: this.viewport.offsetY,
+      width: this.options.referenceWidth * this.viewport.scale,
+      height: this.options.referenceHeight * this.viewport.scale,
+      surfaceWidth: width,
+      surfaceHeight: height,
+    });
     this.viewportWorld.position.set(this.viewport.offsetX, this.viewport.offsetY);
     this.viewportWorld.scale.set(this.viewport.scale);
     this.fitLease(this.pixiBackgroundLease, "cover");
